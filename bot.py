@@ -15,7 +15,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from integrations import BackupState, IntegrationError, Integrations, Service
 from security import Tickets, authorized, redact
 from settings import ROOT, Settings
-from music import MAX_MP3_BYTES, publish_mp3, upload_name
+from music import MAX_COVER_BYTES, MAX_MP3_BYTES, TrackMetadata, has_cover, publish_mp3, upload_name
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +129,21 @@ class BotUI:
                 await remote.download_to_drive(custom_path=temporary, read_timeout=90, connect_timeout=10)
                 if temporary.stat().st_size != media.file_size:
                     raise IntegrationError("MP3 скачан не полностью. Попробуйте отправить файл ещё раз.")
-                result = await asyncio.to_thread(publish_mp3, temporary, directory, filename)
+                cover = None
+                thumbnail = getattr(media, "thumbnail", None)
+                if thumbnail and not await asyncio.to_thread(has_cover, temporary):
+                    if thumbnail.file_size and thumbnail.file_size > MAX_COVER_BYTES:
+                        raise IntegrationError("Обложка из Telegram слишком большая (больше 1 МиБ).")
+                    try:
+                        picture = await thumbnail.get_file(read_timeout=30, connect_timeout=10)
+                        cover = bytes(await picture.download_as_bytearray(read_timeout=30, connect_timeout=10))
+                    except TelegramError:
+                        raise IntegrationError("Не удалось скачать обложку из Telegram. MP3 не опубликован; отправьте его повторно.") from None
+                    if not cover:
+                        raise IntegrationError("Telegram передал пустую обложку. MP3 не опубликован; отправьте его повторно.")
+                metadata = TrackMetadata(title=getattr(media, "title", None) or filename[:-4],
+                                         performer=getattr(media, "performer", None), cover=cover)
+                result = await asyncio.to_thread(publish_mp3, temporary, directory, filename, metadata)
             except TelegramError:
                 raise IntegrationError("Не удалось скачать MP3 из Telegram. Проверьте VPN и размер файла, затем повторите отправку.") from None
             except OSError:
@@ -137,10 +151,19 @@ class BotUI:
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
-        if result.duplicate:
-            await self.show(update, "Этот MP3 уже есть в папке загрузок Navidrome; повторная копия не создана.")
+        if result.duplicate and result.metadata_updated:
+            text = "✅ Исполнитель, название и обложка дополнены там, где их не хватало. Повторная копия трека не создана."
+        elif result.duplicate:
+            text = "Этот MP3 уже есть в папке загрузок Navidrome; повторная копия не создана."
         else:
-            await self.show(update, f"✅ MP3 сохранён: {filename}\nNavidrome добавит его в библиотеку при ближайшем сканировании.")
+            text = f"✅ MP3 сохранён: {filename}\nNavidrome добавит его в библиотеку при ближайшем сканировании."
+        if result.metadata_updated:
+            text += "\nЗвук не перекодирован; исходные байты сохранены отдельно."
+        if result.missing_metadata:
+            text += ("\n⚠️ Не удалось восстановить: " + ", ".join(result.missing_metadata)
+                     + ". Их нет во встроенных тегах и Telegram не передал эти данные."
+                     " Для исходной обложки в полном качестве отправьте MP3 с уже встроенной обложкой как файл.")
+        await self.show(update, text)
 
     async def whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user

@@ -1,4 +1,5 @@
 import os
+import base64
 import shutil
 import tempfile
 import unittest
@@ -8,7 +9,9 @@ from unittest.mock import AsyncMock, patch
 
 from bot import BotUI, build_application
 from integrations import IntegrationError
-from music import MAX_MP3_BYTES, publish_mp3, upload_name
+from music import MAX_MP3_BYTES, TrackMetadata, publish_mp3, upload_name
+from mutagen.mp3 import MP3
+from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1, TXXX
 from settings import Settings
 from telegram.error import NetworkError
 from telegram.ext import MessageHandler
@@ -16,6 +19,19 @@ from telegram.ext import MessageHandler
 
 # Generated 1-second 440 Hz sine wave, not a copyrighted recording.
 FIXTURE = Path(__file__).parent / "fixtures/tone.mp3"
+COVER = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7ioAAAAASUVORK5CYII=")
+
+
+def audio_frames(path):
+    data = path.read_bytes()
+    if data.startswith(b"ID3"):
+        size = 0
+        for value in data[6:10]:
+            size = (size << 7) | value
+        data = data[10 + size:]
+    if data[-128:-125] == b"TAG":
+        data = data[:-128]
+    return data
 
 
 class MusicTests(unittest.TestCase):
@@ -65,6 +81,98 @@ class MusicTests(unittest.TestCase):
         with patch.dict(os.environ, {"NAVIDROME_IMPORT_DIR": "../music"}, clear=True):
             with self.assertRaises(ValueError):
                 Settings.from_env()
+
+    def test_embedded_metadata_artwork_and_exact_bytes_take_precedence(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, temp = Path(d), Path(d) / ".incoming.part"
+            shutil.copyfile(FIXTURE, temp)
+            tags = ID3(temp)
+            tags.add(APIC(mime="image/png", type=3, desc="Original cover", data=COVER))
+            tags.add(TALB(encoding=3, text=["Original album"]))
+            tags.add(TXXX(encoding=3, desc="custom field", text=["Keep me"]))
+            tags.save(temp, v2_version=3)
+            original = temp.read_bytes()
+            result = publish_mp3(temp, root, "Track.mp3", TrackMetadata("Wrong title", "Wrong artist", b"wrong cover"))
+            self.assertEqual((root / result.filename).read_bytes(), original)
+            self.assertFalse(result.metadata_updated)
+            self.assertEqual(result.missing_metadata, ())
+            self.assertFalse((root / ".originals").exists())
+
+    def test_missing_fields_are_filled_and_original_bytes_and_audio_are_preserved(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, temp = Path(d), Path(d) / ".incoming.part"
+            shutil.copyfile(FIXTURE, temp)
+            tags = ID3(temp)
+            tags.delall("TIT2")
+            tags.delall("TPE1")
+            tags.add(TALB(encoding=3, text=["Existing album"]))
+            tags.add(TXXX(encoding=3, desc="custom", text=["Keep me"]))
+            tags.save(temp, v2_version=3)
+            original, frames = temp.read_bytes(), audio_frames(temp)
+            result = publish_mp3(temp, root, "Track.mp3", TrackMetadata("Название", "Исполнитель", COVER))
+            published = root / result.filename
+            tags = ID3(published)
+            self.assertEqual(str(tags["TIT2"]), "Название")
+            self.assertEqual(str(tags["TPE1"]), "Исполнитель")
+            self.assertEqual(str(tags["TALB"]), "Existing album")
+            self.assertEqual(str(tags["TXXX:custom"]), "Keep me")
+            self.assertEqual(tags.version[1], 3)
+            self.assertEqual(tags.getall("APIC")[0].data, COVER)
+            self.assertEqual(audio_frames(published), frames)
+            self.assertEqual(next((root / ".originals").iterdir()).read_bytes(), original)
+            self.assertEqual(temp.read_bytes(), original)
+            self.assertTrue(result.metadata_updated)
+            self.assertEqual(result.missing_metadata, ())
+
+    def test_resending_legacy_upload_repairs_it_without_duplicating_or_losing_tags(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, temp = Path(d), Path(d) / ".incoming.part"
+            shutil.copyfile(FIXTURE, temp)
+            tags = ID3(temp)
+            tags.delall("TPE1")
+            tags.save(temp)
+            first = publish_mp3(temp, root, "Track.mp3")
+            repaired = publish_mp3(temp, root, "Renamed.mp3", TrackMetadata("Do not replace", "Artist", COVER))
+            self.assertEqual(repaired.filename, first.filename)
+            self.assertTrue(repaired.duplicate)
+            self.assertTrue(repaired.metadata_updated)
+            self.assertEqual(len(list(root.glob("*.mp3"))), 1)
+            published = root / repaired.filename
+            enriched = published.read_bytes()
+            third = publish_mp3(temp, root, "Track.mp3", TrackMetadata("Another title", "Another artist", b"bad image"))
+            self.assertFalse(third.metadata_updated)
+            self.assertEqual(published.read_bytes(), enriched)
+            self.assertEqual(str(ID3(published)["TPE1"]), "Artist")
+            self.assertEqual(ID3(published).getall("APIC")[0].data, COVER)
+
+    def test_completely_untagged_mp3_gets_telegram_fields_without_changing_audio(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, temp = Path(d), Path(d) / ".incoming.part"
+            shutil.copyfile(FIXTURE, temp)
+            ID3(temp).delete(temp)
+            self.assertIsNone(MP3(temp).tags)
+            frames = audio_frames(temp)
+            result = publish_mp3(temp, root, "Track.mp3", TrackMetadata("Title", "Artist", COVER))
+            published = root / result.filename
+            self.assertEqual(str(ID3(published)["TPE1"]), "Artist")
+            self.assertEqual(ID3(published).getall("APIC")[0].data, COVER)
+            self.assertEqual(audio_frames(published), frames)
+            self.assertEqual(result.missing_metadata, ())
+
+    def test_absent_metadata_is_reported_and_invalid_cover_never_replaces_a_track(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, temp = Path(d), Path(d) / ".incoming.part"
+            shutil.copyfile(FIXTURE, temp)
+            tags = ID3(temp)
+            tags.delall("TPE1")
+            tags.save(temp)
+            result = publish_mp3(temp, root, "Track.mp3", TrackMetadata())
+            self.assertEqual(result.missing_metadata, ("исполнитель", "обложка"))
+            previous = (root / result.filename).read_bytes()
+            with self.assertRaises(IntegrationError):
+                publish_mp3(temp, root, "Track.mp3", TrackMetadata(cover=b"not an image"))
+            self.assertEqual((root / result.filename).read_bytes(), previous)
+            self.assertEqual(list(root.glob(".shrimp-tags-*")), [])
 
 
 class MusicHandlerTests(unittest.IsolatedAsyncioTestCase):
@@ -130,3 +238,49 @@ class MusicHandlerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(isinstance(h, MessageHandler) for h in app.handlers[0]))
         finally:
             await app.bot_data["ui"].api.http.aclose()
+
+    async def test_audio_performer_and_separate_thumbnail_reach_id3(self):
+        update, media, _ = self.update(audio=True)
+        # This download has no artist, title or artwork embedded in the MP3.
+        async def download(**kwargs):
+            shutil.copyfile(FIXTURE, kwargs["custom_path"])
+            tags = ID3(kwargs["custom_path"])
+            tags.delall("TIT2")
+            tags.delall("TPE1")
+            tags.save(kwargs["custom_path"])
+        with tempfile.NamedTemporaryFile() as f:
+            await download(custom_path=f.name)
+            media.file_size = Path(f.name).stat().st_size
+        media.get_file.return_value.download_to_drive.side_effect = download
+        media.performer = "Telegram artist"
+        image = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(COVER)))
+        media.thumbnail = SimpleNamespace(file_size=len(COVER), get_file=AsyncMock(return_value=image))
+        await self.ui.protect(self.ui.import_music)(update, None)
+        published = next(self.root.glob("*.mp3"))
+        tags = ID3(published)
+        self.assertEqual(str(tags["TIT2"]), "Трек")
+        self.assertEqual(str(tags["TPE1"]), "Telegram artist")
+        self.assertEqual(tags.getall("APIC")[0].data, COVER)
+
+    async def test_existing_artwork_prevents_thumbnail_download(self):
+        update, media, _ = self.update(audio=True)
+        async def download(**kwargs):
+            shutil.copyfile(FIXTURE, kwargs["custom_path"])
+            tags = ID3(kwargs["custom_path"])
+            tags.add(APIC(mime="image/png", type=3, data=COVER))
+            tags.save(kwargs["custom_path"])
+        with tempfile.NamedTemporaryFile() as f:
+            await download(custom_path=f.name)
+            media.file_size = Path(f.name).stat().st_size
+        media.get_file.return_value.download_to_drive.side_effect = download
+        media.thumbnail = SimpleNamespace(file_size=100, get_file=AsyncMock())
+        await self.ui.protect(self.ui.import_music)(update, None)
+        media.thumbnail.get_file.assert_not_awaited()
+        self.assertEqual(ID3(next(self.root.glob("*.mp3"))).getall("APIC")[0].data, COVER)
+
+    async def test_thumbnail_download_failure_does_not_silently_drop_the_cover(self):
+        update, media, _ = self.update(audio=True)
+        media.thumbnail = SimpleNamespace(file_size=100, get_file=AsyncMock(side_effect=NetworkError("secret")))
+        await self.ui.protect(self.ui.import_music)(update, None)
+        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertIn("обложку", self.ui.show.await_args.args[1])
