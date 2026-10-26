@@ -2,16 +2,20 @@
 
 import asyncio
 import logging
+import tempfile
 from functools import wraps
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.error import TelegramError
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from integrations import BackupState, IntegrationError, Integrations, Service
 from security import Tickets, authorized, redact
 from settings import ROOT, Settings
+from music import MAX_MP3_BYTES, publish_mp3, upload_name
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,7 @@ class BotUI:
         self.settings, self.api = settings, integrations
         self.tickets = Tickets()
         self.mutation_lock = asyncio.Lock()
+        self.music_slots = asyncio.Semaphore(1)
         self.alert_states: dict[str, tuple] = {}
 
     def permitted(self, update: Update) -> bool:
@@ -92,8 +97,50 @@ class BotUI:
         text += ("\n\nПерезапуск и деплой доступны кнопками в /apps."
                  "\n/backups run имя — создать бэкап."
                  "\n/home run scene.имя — запустить разрешённый сценарий."
+                 "\nПришлите MP3 до 20 МБ — добавлю его в Navidrome."
                  "\nКоманды сервера доступны только разрешённым пользователям.")
         await self.show(update, text)
+
+    async def import_music(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        if not message:
+            return
+        media = message.audio or message.document
+        if not media:
+            return
+        if not self.settings.navidrome_import_dir:
+            raise IntegrationError("Загрузка музыки не настроена: задайте NAVIDROME_IMPORT_DIR и подключите папку Navidrome.")
+        filename = upload_name(media.file_name, media.mime_type, getattr(media, "title", None))
+        if not media.file_size or not 0 < media.file_size <= MAX_MP3_BYTES:
+            raise IntegrationError("Telegram позволяет боту скачивать файлы до 20 МБ. Пришлите MP3 меньшего размера.")
+        directory = Path(self.settings.navidrome_import_dir)
+        if not directory.is_dir():
+            raise IntegrationError("Папка загрузки Navidrome недоступна. Проверьте mount и NAVIDROME_IMPORT_DIR.")
+        if self.music_slots.locked():
+            await self.show(update, "Сейчас загружается другой трек. Дождитесь результата и пришлите MP3 ещё раз.")
+            return
+        async with self.music_slots:
+            await self.show(update, f"🦐 Загружаю в музыкальную библиотеку: {filename}")
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=directory, prefix=".shrimp-", suffix=".part", delete=False) as stream:
+                    temporary = Path(stream.name)
+                remote = await media.get_file(read_timeout=30, connect_timeout=10)
+                await remote.download_to_drive(custom_path=temporary, read_timeout=90, connect_timeout=10)
+                if temporary.stat().st_size != media.file_size:
+                    raise IntegrationError("MP3 скачан не полностью. Попробуйте отправить файл ещё раз.")
+                result = await asyncio.to_thread(publish_mp3, temporary, directory, filename)
+            except TelegramError:
+                raise IntegrationError("Не удалось скачать MP3 из Telegram. Проверьте VPN и размер файла, затем повторите отправку.") from None
+            except OSError:
+                raise IntegrationError("Не удалось записать MP3. Проверьте права и свободное место в папке Navidrome.") from None
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        if result.duplicate:
+            await self.show(update, "Этот MP3 уже есть в папке загрузок Navidrome; повторная копия не создана.")
+        else:
+            await self.show(update, f"✅ MP3 сохранён: {filename}\nNavidrome добавит его в библиотеку при ближайшем сканировании.")
 
     async def whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -329,6 +376,8 @@ def build_application(settings: Settings) -> Application:
     for name in ("status", "apps", "logs", "vpn", "backups", "minecraft", "home"):
         app.add_handler(CommandHandler(name, ui.protect(getattr(ui, name))))
     app.add_handler(CallbackQueryHandler(ui.callback, pattern=r"^ui:"))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & (filters.AUDIO | filters.Document.ALL),
+                                   ui.protect(ui.import_music)))
     app.add_error_handler(on_error)
     return app
 

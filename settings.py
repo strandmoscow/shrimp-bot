@@ -44,6 +44,7 @@ class Settings:
     alert_chat: int | None = None
     alert_thread: int | None = None
     backup_check_seconds: int = 3600
+    navidrome_import_dir: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -83,6 +84,7 @@ class Settings:
             alert_chat=int(e["BACKUP_ALERT_CHAT_ID"]) if e.get("BACKUP_ALERT_CHAT_ID") else None,
             alert_thread=int(e["BACKUP_ALERT_THREAD_ID"]) if e.get("BACKUP_ALERT_THREAD_ID") else None,
             backup_check_seconds=int(e.get("BACKUP_CHECK_SECONDS", "3600")),
+            navidrome_import_dir=e.get("NAVIDROME_IMPORT_DIR", "").strip(),
         )
         if any(uid <= 0 for uid in s.allowed_users):
             raise ValueError("ALLOWED_USER_IDS содержит ID пользователей, а не групп.")
@@ -100,6 +102,8 @@ class Settings:
             raise ValueError("Порт должен быть от 1 до 65535.")
         if s.backup_check_seconds < 60:
             raise ValueError("BACKUP_CHECK_SECONDS должен быть не меньше 60.")
+        if s.navidrome_import_dir and not Path(s.navidrome_import_dir).is_absolute():
+            raise ValueError("NAVIDROME_IMPORT_DIR должен быть абсолютным путём внутри контейнера.")
         if s.alert_chat and s.allowed_chats and s.alert_chat not in s.allowed_chats:
             raise ValueError("Добавьте BACKUP_ALERT_CHAT_ID в ALLOWED_CHAT_IDS.")
         if s.alert_chat and not s.allowed_users:
