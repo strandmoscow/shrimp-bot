@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock, patch
 
 from bot import BotUI, build_application
 from integrations import IntegrationError
-from music import MAX_MP3_BYTES, TrackMetadata, publish_mp3, upload_name
+from music import (MAX_MP3_BYTES, TrackMetadata, edit_track, file_digest, find_track, message_track,
+                   parse_metadata_edit, publish_mp3, read_track_metadata, track_id, upload_name)
 from mutagen.mp3 import MP3
 from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1, TXXX
 from settings import Settings
@@ -284,3 +285,174 @@ class MusicHandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.ui.protect(self.ui.import_music)(update, None)
         self.assertEqual(list(self.root.iterdir()), [])
         self.assertIn("обложку", self.ui.show.await_args.args[1])
+
+
+class MetadataEditTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        temp = self.root / ".incoming.part"
+        shutil.copyfile(FIXTURE, temp)
+        tags = ID3(temp)
+        tags.add(TALB(encoding=3, text=["Original album"]))
+        tags.add(TXXX(encoding=3, desc="Lyrics", text=["Keep lyrics"]))
+        tags.add(APIC(mime="image/png", type=3, desc="Front", data=COVER))
+        tags.add(APIC(mime="image/png", type=4, desc="Back", data=COVER + b"back"))
+        tags.save(temp, v2_version=3)
+        result = publish_mp3(temp, self.root, "Original.mp3")
+        self.digest = track_id(result.filename)
+        self.path = self.root / result.filename
+        self.original = self.path.read_bytes()
+        temp.unlink()
+
+    def test_partial_edit_preserves_artwork_other_tags_and_audio(self):
+        frames = audio_frames(self.path)
+        self.assertTrue(edit_track(self.root, self.digest, TrackMetadata(performer="Кино", album="Группа крови")))
+        tags = ID3(self.path)
+        self.assertEqual(str(tags["TPE1"]), "Кино")
+        self.assertEqual(str(tags["TALB"]), "Группа крови")
+        self.assertEqual(str(tags["TXXX:Lyrics"]), "Keep lyrics")
+        self.assertEqual(str(tags["TIT2"]), str(ID3(FIXTURE)["TIT2"]))
+        self.assertEqual(len(tags.getall("APIC")), 2)
+        self.assertEqual(tags.version[1], 3)
+        self.assertEqual(audio_frames(self.path), frames)
+        self.assertEqual(len(list(self.root.glob("*.mp3"))), 1)
+        self.assertEqual((self.root / ".originals" / f"{self.digest}.original").read_bytes(), self.original)
+        edit_track(self.root, self.digest, TrackMetadata(title="Новое название"))
+        self.assertEqual((self.root / ".originals" / f"{self.digest}.original").read_bytes(), self.original)
+
+    def test_edit_without_cover_is_allowed_for_track_without_cover(self):
+        tags = ID3(self.path)
+        tags.delall("APIC")
+        tags.save(self.path)
+        self.assertTrue(edit_track(self.root, self.digest, TrackMetadata(performer="Artist")))
+        current = read_track_metadata(self.root, self.digest)
+        self.assertEqual(current["performer"], "Artist")
+        self.assertFalse(current["cover"])
+
+    def test_cover_replaces_front_but_keeps_other_pictures(self):
+        tags = ID3(self.path)
+        back = next(p for p in tags.getall("APIC") if p.type == 4)
+        tags.delall("APIC:Back")
+        back.desc = "Telegram cover"
+        tags.add(back)
+        tags.save(self.path)
+        new_cover = COVER + b"new"
+        edit_track(self.root, self.digest, TrackMetadata(cover=new_cover))
+        pictures = ID3(self.path).getall("APIC")
+        self.assertEqual([p.data for p in pictures if p.type == 3], [new_cover])
+        self.assertEqual([p.data for p in pictures if p.type == 4], [COVER + b"back"])
+        self.assertFalse(edit_track(self.root, self.digest, TrackMetadata(cover=new_cover)))
+
+    def test_bad_cover_leaves_existing_file_unchanged(self):
+        with self.assertRaises(IntegrationError):
+            edit_track(self.root, self.digest, TrackMetadata(performer="Wrong", cover=b"invalid"))
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(list(self.root.glob("*.part")), [])
+
+    def test_message_mapping_persists_and_is_scoped_to_chat(self):
+        self.assertIsNone(message_track(self.root, 42, 7))
+        message_track(self.root, 42, 7, self.digest)
+        self.assertEqual(message_track(Path(str(self.root)), 42, 7), self.digest)
+        self.assertIsNone(message_track(self.root, -100, 7))
+        self.assertEqual((self.root / ".shrimp-messages.sqlite3").stat().st_mode & 0o777, 0o600)
+
+    def test_track_paths_cannot_escape_import_directory(self):
+        for digest in ("../outside", "/etc/passwd", "x" * 64):
+            with self.assertRaises(IntegrationError):
+                edit_track(self.root, digest, TrackMetadata(title="Bad"))
+        target = self.path.with_name("Link-" + "a" * 64 + ".mp3")
+        target.symlink_to(self.path)
+        with self.assertRaises(IntegrationError):
+            find_track(self.root, "a" * 64)
+
+    def test_parse_fields_only_changes_explicit_values(self):
+        metadata = parse_metadata_edit("/tags@shrimp_bot\nИсполнитель: Кино\nАльбом: Группа крови\nИсполнитель альбома: Кино")
+        self.assertEqual(metadata.performer, "Кино")
+        self.assertEqual(metadata.album_artist, "Кино")
+        self.assertIsNone(metadata.title)
+        self.assertIsNone(metadata.cover)
+        self.assertEqual(parse_metadata_edit("/tags"), TrackMetadata())
+        for text in ("/tags\nArtist: ", "/tags\nAlbum: a\nАльбом: b", "/tags\nпуть: /etc/passwd"):
+            with self.assertRaises(IntegrationError):
+                parse_metadata_edit(text)
+
+
+class MetadataEditHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        temp = self.root / ".incoming.part"
+        shutil.copyfile(FIXTURE, temp)
+        self.digest = file_digest(temp)
+        self.path = self.root / publish_mp3(temp, self.root, "Original.mp3").filename
+        temp.unlink()
+        self.ui = BotUI(Settings(allowed_users=frozenset({42}), navidrome_import_dir=str(self.root)), None)
+        self.ui.show = AsyncMock(return_value=SimpleNamespace(message_id=12))
+        message_track(self.root, 42, 7, self.digest)
+
+    def update(self, text="/tags\nИсполнитель: Кино", *, user=42):
+        return SimpleNamespace(effective_chat=SimpleNamespace(id=42), effective_user=SimpleNamespace(id=user),
+                               effective_message=SimpleNamespace(text=text, caption=None, message_id=11,
+                                   reply_to_message=SimpleNamespace(message_id=7), photo=None, document=None))
+
+    async def test_text_edit_needs_no_cover_and_new_confirmation_can_be_replied_to(self):
+        await self.ui.protect(self.ui.tags)(self.update(), None)
+        self.assertEqual(str(ID3(self.path)["TPE1"]), "Кино")
+        self.assertEqual(len(list(self.root.glob("*.mp3"))), 1)
+        self.assertEqual(message_track(self.root, 42, 12), self.digest)
+        self.assertIn("необязательно", self.ui.show.await_args.args[1])
+
+    async def test_unauthorized_edit_never_changes_file(self):
+        original = self.path.read_bytes()
+        await self.ui.protect(self.ui.tags)(self.update(user=99), None)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    async def test_original_audio_without_mapping_is_recognized_after_restart(self):
+        update = self.update()
+        async def download(**kwargs):
+            shutil.copyfile(FIXTURE, kwargs["custom_path"])
+        remote = SimpleNamespace(download_to_drive=AsyncMock(side_effect=download))
+        media = SimpleNamespace(file_name="Original.mp3", mime_type="audio/mpeg", file_size=FIXTURE.stat().st_size,
+                                get_file=AsyncMock(return_value=remote))
+        update.effective_message.reply_to_message = SimpleNamespace(message_id=999, audio=media)
+        await self.ui.protect(self.ui.tags)(update, None)
+        self.assertEqual(str(ID3(self.path)["TPE1"]), "Кино")
+        self.assertEqual(message_track(self.root, 42, 999), self.digest)
+        self.assertEqual(list(self.root.glob("*.part")), [])
+
+    async def test_unknown_or_missing_reply_cannot_edit_an_arbitrary_track(self):
+        original = self.path.read_bytes()
+        for reference in (None, SimpleNamespace(message_id=999)):
+            update = self.update()
+            update.effective_message.reply_to_message = reference
+            await self.ui.protect(self.ui.tags)(update, None)
+            self.assertEqual(self.path.read_bytes(), original)
+
+    async def test_photo_reply_adds_cover_and_can_also_change_album(self):
+        picture = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(COVER)))
+        photo = SimpleNamespace(file_size=len(COVER), get_file=AsyncMock(return_value=picture))
+        update = self.update(text=None)
+        update.effective_message.photo = [photo]
+        update.effective_message.caption = "/tags\nАльбом: Альбом"
+        await self.ui.protect(self.ui.music_attachment)(update, None)
+        tags = ID3(self.path)
+        self.assertEqual(str(tags["TALB"]), "Альбом")
+        self.assertEqual(tags.getall("APIC")[0].data, COVER)
+
+    async def test_jpeg_or_png_document_reply_is_cover_not_music_import(self):
+        picture = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(COVER)))
+        document = SimpleNamespace(file_name="cover.png", mime_type="image/png", file_size=len(COVER),
+                                   get_file=AsyncMock(return_value=picture))
+        update = self.update(text=None)
+        update.effective_message.document = document
+        await self.ui.protect(self.ui.music_attachment)(update, None)
+        self.assertEqual(ID3(self.path).getall("APIC")[0].data, COVER)
+
+    async def test_empty_command_only_shows_metadata_and_instructions(self):
+        original = self.path.read_bytes()
+        await self.ui.protect(self.ui.tags)(self.update(text="/tags"), None)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertIn("Чтобы исправить", self.ui.show.await_args.args[1])

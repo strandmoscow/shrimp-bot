@@ -4,14 +4,16 @@ import hashlib
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import unicodedata
 from dataclasses import dataclass
+from contextlib import closing
 from pathlib import Path
 
 from mutagen.mp3 import MP3
 from mutagen import MutagenError
-from mutagen.id3 import APIC, TIT2, TPE1
+from mutagen.id3 import APIC, TALB, TIT2, TPE1, TPE2
 
 from integrations import IntegrationError
 
@@ -26,6 +28,8 @@ class TrackMetadata:
     title: str | None = None
     performer: str | None = None
     cover: bytes | None = None
+    album: str | None = None
+    album_artist: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,8 +75,8 @@ def missing_metadata(path: Path) -> tuple[str, ...]:
     return tuple(missing)
 
 
-def complete_metadata(path: Path, metadata: TrackMetadata) -> bool:
-    """Only fill empty ID3 fields. Existing artwork and other frames take precedence."""
+def complete_metadata(path: Path, metadata: TrackMetadata, *, overwrite: bool = False) -> bool:
+    """Fill empty fields on import; overwrite only explicit fields for manual edits."""
     audio = MP3(path, translate=False)
     tags = audio.tags
     if tags is None:
@@ -80,11 +84,16 @@ def complete_metadata(path: Path, metadata: TrackMetadata) -> bool:
         tags = audio.tags
     version = tags.version[1] if tags.version[1] in (3, 4) else 4
     changed = False
-    for key, cls, value in (("TIT2", TIT2, metadata.title), ("TPE1", TPE1, metadata.performer)):
-        if value and value.strip() and not any(str(t).strip() for frame in tags.getall(key) for t in frame.text):
+    for key, cls, value in (("TIT2", TIT2, metadata.title), ("TPE1", TPE1, metadata.performer),
+                            ("TALB", TALB, metadata.album), ("TPE2", TPE2, metadata.album_artist)):
+        existing = [str(t).strip() for frame in tags.getall(key) for t in frame.text if str(t).strip()]
+        if value and value.strip() and (not existing or (overwrite and existing != [value.strip()])):
             tags.add(cls(encoding=3, text=[value.strip()]))
             changed = True
-    if metadata.cover and not any(frame.data for frame in tags.getall("APIC")):
+    pictures = tags.getall("APIC")
+    front = [p for p in pictures if p.type == 3]
+    if metadata.cover and (not any(frame.data for frame in pictures) or
+                           (overwrite and not any(p.data == metadata.cover for p in front))):
         data = metadata.cover
         if len(data) > MAX_COVER_BYTES:
             raise IntegrationError("Обложка из Telegram слишком большая (больше 1 МиБ).")
@@ -94,7 +103,14 @@ def complete_metadata(path: Path, metadata: TrackMetadata) -> bool:
             mime = "image/png"
         else:
             raise IntegrationError("Telegram передал обложку в неподдерживаемом формате. Нужен JPEG или PNG.")
-        tags.add(APIC(encoding=3, mime=mime, type=3, desc="Telegram cover", data=data))
+        if overwrite:
+            # Replace the front cover only; retain booklets and other embedded images.
+            tags.setall("APIC", [p for p in pictures if p.type != 3])
+        description = "Telegram cover"
+        used = {p.desc for p in tags.getall("APIC")}
+        while description in used:
+            description += " (front)"
+        tags.add(APIC(encoding=3, mime=mime, type=3, desc=description, data=data))
         changed = True
     if changed:
         tags.save(path, v2_version=version)
@@ -178,3 +194,99 @@ def publish_mp3(temporary: Path, directory: Path, filename: str,
         raise IntegrationError("Не удалось сохранить метаданные MP3. Исходный файл не заменён.") from None
     except OSError:
         raise IntegrationError("Не удалось сохранить MP3. Проверьте папку NAVIDROME_IMPORT_DIR, права и свободное место.") from None
+
+
+def file_digest(path: Path) -> str:
+    checksum = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
+
+
+def track_id(filename: str) -> str:
+    match = re.fullmatch(r".+-([0-9a-f]{64})\.mp3", filename)
+    if not match:
+        raise IntegrationError("Не удалось определить загруженный трек.")
+    return match[1]
+
+
+def find_track(directory: Path, digest: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise IntegrationError("Некорректная ссылка на трек.")
+    paths = list(directory.glob(f"*-{digest}.mp3"))
+    if len(paths) != 1 or paths[0].is_symlink() or not paths[0].is_file():
+        raise IntegrationError("Трек не найден в загрузках Navidrome. Сначала отправьте MP3 боту.")
+    return paths[0]
+
+
+def message_track(directory: Path, chat_id: int, message_id: int, digest: str | None = None) -> str | None:
+    """Persist reply associations across restarts without putting file paths in Telegram."""
+    db = directory / ".shrimp-messages.sqlite3"
+    if digest is None and not db.exists():
+        return None
+    if digest is not None:
+        find_track(directory, digest)
+    try:
+        with closing(sqlite3.connect(db, timeout=5)) as connection, connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS messages (chat INTEGER, message INTEGER, digest TEXT NOT NULL, PRIMARY KEY(chat, message))")
+            if digest is not None:
+                connection.execute("INSERT INTO messages VALUES (?, ?, ?) ON CONFLICT(chat, message) DO UPDATE SET digest=excluded.digest",
+                                   (chat_id, message_id, digest))
+                db.chmod(0o600)
+                return digest
+            row = connection.execute("SELECT digest FROM messages WHERE chat=? AND message=?", (chat_id, message_id)).fetchone()
+            return row[0] if row else None
+    except (OSError, sqlite3.Error):
+        raise IntegrationError("Не удалось прочитать привязку сообщения к треку. Проверьте папку загрузок.") from None
+
+
+def parse_metadata_edit(text: str) -> TrackMetadata:
+    body = re.sub(r"^/tags(?:@[A-Za-z0-9_]+)?(?:\s|$)", "", text.strip(), count=1)
+    aliases = {"название": "title", "title": "title", "исполнитель": "performer", "artist": "performer",
+               "альбом": "album", "album": "album", "исполнитель альбома": "album_artist", "album artist": "album_artist"}
+    values = {}
+    for line in body.splitlines():
+        if not line.strip():
+            continue
+        key, separator, value = line.partition(":")
+        field = aliases.get(key.strip().casefold())
+        if not separator or not field:
+            raise IntegrationError("Каждое поле пишите с новой строки: Название: …, Исполнитель: …, Альбом: …, Исполнитель альбома: …")
+        if field in values or not value.strip() or len(value.strip()) > 300:
+            raise IntegrationError("Укажите каждое поле один раз и непустым значением до 300 символов. Ненужные поля пропустите.")
+        values[field] = value.strip()
+    return TrackMetadata(**values)
+
+
+def read_track_metadata(directory: Path, digest: str) -> dict:
+    try:
+        tags = MP3(find_track(directory, digest)).tags
+        result = {field: str(tags.get(key, "")) if tags else "" for field, key in
+                  (("title", "TIT2"), ("performer", "TPE1"), ("album", "TALB"), ("album_artist", "TPE2"))}
+        result["cover"] = bool(tags and any(p.data for p in tags.getall("APIC")))
+        return result
+    except (OSError, MutagenError, ValueError, EOFError):
+        raise IntegrationError("Не удалось прочитать метаданные трека.") from None
+
+
+def edit_track(directory: Path, digest: str, metadata: TrackMetadata) -> bool:
+    path = find_track(directory, digest)
+    staging = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".shrimp-edit-", suffix=".part", delete=False) as stream:
+            staging = Path(stream.name)
+        shutil.copyfile(path, staging)
+        if not complete_metadata(staging, metadata, overwrite=True):
+            return False
+        preserve_original(path, directory, digest)
+        staging.chmod(0o644)
+        with staging.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(staging, path)
+        return True
+    except (OSError, MutagenError, ValueError, EOFError):
+        raise IntegrationError("Не удалось обновить метаданные. Существующий трек не заменён.") from None
+    finally:
+        if staging is not None:
+            staging.unlink(missing_ok=True)

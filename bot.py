@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import tempfile
+from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 
@@ -15,11 +16,14 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from integrations import BackupState, IntegrationError, Integrations, Service
 from security import Tickets, authorized, redact
 from settings import ROOT, Settings
-from music import MAX_COVER_BYTES, MAX_MP3_BYTES, TrackMetadata, has_cover, publish_mp3, upload_name
+from music import (MAX_COVER_BYTES, MAX_MP3_BYTES, TrackMetadata, edit_track, file_digest, find_track,
+                   has_cover, message_track, parse_metadata_edit, publish_mp3, read_track_metadata,
+                   track_id, upload_name)
 
 logger = logging.getLogger(__name__)
 
 COMMANDS = [
+    ("tags", "Изменить метаданные ответом на трек"),
     ("status", "Состояние сервера и приложений"),
     ("apps", "Приложения, логи и управление"),
     ("logs", "Логи: /logs immich"),
@@ -91,6 +95,7 @@ class BotUI:
                     buttons.append(InlineKeyboardButton(label, callback_data=data))
                 keyboard.append(buttons)
             await message.edit_reply_markup(InlineKeyboardMarkup(keyboard))
+        return message
 
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "Shrimp Bot 🦐\n\n" + "\n".join(f"/{name} — {label}" for name, label in COMMANDS)
@@ -98,8 +103,107 @@ class BotUI:
                  "\n/backups run имя — создать бэкап."
                  "\n/home run scene.имя — запустить разрешённый сценарий."
                  "\nПришлите MP3 до 20 МБ — добавлю его в Navidrome."
+                 "\nОтветьте на трек командой /tags и полями Название:, Исполнитель:, Альбом:."
+                 "\nФото ответом на трек заменит обложку. Обложка необязательна."
                  "\nКоманды сервера доступны только разрешённым пользователям.")
         await self.show(update, text)
+
+    async def remember_music_message(self, update: Update, digest: str, response=None):
+        directory = Path(self.settings.navidrome_import_dir)
+        for message in (update.effective_message, response):
+            message_id = getattr(message, "message_id", None)
+            if isinstance(message_id, int):
+                await asyncio.to_thread(message_track, directory, update.effective_chat.id, message_id, digest)
+
+    async def referenced_track(self, update: Update, directory: Path) -> str:
+        reference = getattr(update.effective_message, "reply_to_message", None)
+        if not reference:
+            raise IntegrationError("Ответьте на сообщение с MP3 или на подтверждение его загрузки командой /tags. Обложку можно не добавлять.")
+        digest = await asyncio.to_thread(message_track, directory, update.effective_chat.id, reference.message_id)
+        if digest:
+            await asyncio.to_thread(find_track, directory, digest)
+            return digest
+        media = getattr(reference, "audio", None) or getattr(reference, "document", None)
+        if not media:
+            raise IntegrationError("Это сообщение не связано с треком. Ответьте на исходный MP3, отправленный боту.")
+        upload_name(media.file_name, media.mime_type, getattr(media, "title", None))
+        if not media.file_size or not 0 < media.file_size <= MAX_MP3_BYTES:
+            raise IntegrationError("Не удалось определить трек: исходный MP3 должен быть не больше 20 МБ.")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=".shrimp-reference-", suffix=".part", delete=False) as stream:
+                temporary = Path(stream.name)
+            remote = await media.get_file(read_timeout=30, connect_timeout=10)
+            await remote.download_to_drive(custom_path=temporary, read_timeout=90, connect_timeout=10)
+            if temporary.stat().st_size != media.file_size:
+                raise IntegrationError("Не удалось полностью скачать исходный MP3 для определения трека.")
+            digest = await asyncio.to_thread(file_digest, temporary)
+            await asyncio.to_thread(find_track, directory, digest)
+            await asyncio.to_thread(message_track, directory, update.effective_chat.id, reference.message_id, digest)
+            return digest
+        except TelegramError:
+            raise IntegrationError("Не удалось получить исходный MP3 из Telegram. Попробуйте ещё раз.") from None
+        except OSError:
+            raise IntegrationError("Не удалось определить трек. Проверьте папку загрузок и свободное место.") from None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    async def tags(self, update: Update, context: ContextTypes.DEFAULT_TYPE, *, cover_file=None):
+        message = update.effective_message
+        if not message:
+            return
+        directory = Path(self.settings.navidrome_import_dir)
+        if not self.settings.navidrome_import_dir or not directory.is_dir():
+            raise IntegrationError("Папка Navidrome недоступна. Проверьте NAVIDROME_IMPORT_DIR и mount.")
+        metadata = parse_metadata_edit(message.text or message.caption or "")
+        if self.music_slots.locked():
+            raise IntegrationError("Сейчас обрабатывается другой трек. Повторите команду после завершения.")
+        async with self.music_slots:
+            digest = await self.referenced_track(update, directory)
+            if cover_file:
+                if cover_file.file_size and cover_file.file_size > MAX_COVER_BYTES:
+                    raise IntegrationError("Обложка должна быть JPEG или PNG размером до 1 МиБ.")
+                try:
+                    remote = await cover_file.get_file(read_timeout=30, connect_timeout=10)
+                    cover = bytes(await remote.download_as_bytearray(read_timeout=30, connect_timeout=10))
+                except TelegramError:
+                    raise IntegrationError("Не удалось скачать обложку. Трек не изменён; повторите отправку.") from None
+                if not cover:
+                    raise IntegrationError("Обложка пуста. Трек не изменён.")
+                metadata = replace(metadata, cover=cover)
+            is_edit = any((metadata.title, metadata.performer, metadata.album, metadata.album_artist, metadata.cover))
+            changed = await asyncio.to_thread(edit_track, directory, digest, metadata) if is_edit else False
+            current = await asyncio.to_thread(read_track_metadata, directory, digest)
+            labels = (("title", "Название"), ("performer", "Исполнитель"), ("album", "Альбом"),
+                      ("album_artist", "Исполнитель альбома"))
+            text = "✅ Метаданные обновлены." if changed else "Метаданные трека:"
+            text += "\n" + "\n".join(f"{label}: {current[key] or 'не указан'}" for key, label in labels)
+            text += "\nОбложка: " + ("есть" if current["cover"] else "нет — добавлять необязательно")
+            if changed:
+                text += "\nNavidrome перечитает изменения автоматически. Звук не перекодирован, дубликат не создан."
+            elif not is_edit:
+                text += ("\n\nЧтобы исправить, ответьте на этот трек или это сообщение, например:\n"
+                         "/tags\nИсполнитель: Кино\nНазвание: Группа крови\nАльбом: Группа крови\n"
+                         "Исполнитель альбома: Кино\n\nУказывайте только нужные поля. Фото или JPEG/PNG ответом заменит обложку."
+                         " Без картинки текущая обложка сохранится.")
+            response = await self.show(update, text)
+            await self.remember_music_message(update, digest, response)
+
+    async def music_attachment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        if not message:
+            return
+        photos = getattr(message, "photo", None)
+        document = getattr(message, "document", None)
+        if photos:
+            suitable = [p for p in photos if p.file_size and p.file_size <= MAX_COVER_BYTES]
+            await self.tags(update, context, cover_file=(suitable or photos)[-1])
+        elif document and (document.mime_type in {"image/jpeg", "image/png"} or
+                           (document.file_name or "").lower().endswith((".jpg", ".jpeg", ".png"))):
+            await self.tags(update, context, cover_file=document)
+        else:
+            await self.import_music(update, context)
 
     async def import_music(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.effective_message
@@ -160,10 +264,13 @@ class BotUI:
         if result.metadata_updated:
             text += "\nЗвук не перекодирован; исходные байты сохранены отдельно."
         if result.missing_metadata:
-            text += ("\n⚠️ Не удалось восстановить: " + ", ".join(result.missing_metadata)
-                     + ". Их нет во встроенных тегах и Telegram не передал эти данные."
-                     " Для исходной обложки в полном качестве отправьте MP3 с уже встроенной обложкой как файл.")
-        await self.show(update, text)
+            if "исполнитель" in result.missing_metadata:
+                text += "\nИсполнитель не указан. Его можно задать ответом: /tags Исполнитель: …"
+            if "обложка" in result.missing_metadata:
+                text += "\nОбложки нет — это необязательно. Если появится, пришлите картинку ответом на трек."
+        text += "\nДля редактирования ответьте на трек или это сообщение командой /tags."
+        response = await self.show(update, text)
+        await self.remember_music_message(update, track_id(result.filename), response)
 
     async def whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -396,11 +503,11 @@ def build_application(settings: Settings) -> Application:
     app.bot_data["ui"] = ui
     app.add_handler(CommandHandler(["start", "help"], ui.help))
     app.add_handler(CommandHandler("whoami", ui.whoami))
-    for name in ("status", "apps", "logs", "vpn", "backups", "minecraft", "home"):
+    for name in ("status", "apps", "logs", "vpn", "backups", "minecraft", "home", "tags"):
         app.add_handler(CommandHandler(name, ui.protect(getattr(ui, name))))
     app.add_handler(CallbackQueryHandler(ui.callback, pattern=r"^ui:"))
-    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & (filters.AUDIO | filters.Document.ALL),
-                                   ui.protect(ui.import_music)))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & (filters.AUDIO | filters.Document.ALL | filters.PHOTO),
+                                   ui.protect(ui.music_attachment)))
     app.add_error_handler(on_error)
     return app
 
