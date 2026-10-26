@@ -1,0 +1,5 @@
+[phases.setup]
+nixPkgs = ["...", "openssh"]
+
+[start]
+cmd = "python bot.py"
